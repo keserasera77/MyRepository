@@ -8,24 +8,37 @@ import Data.Array.MArray
 import Data.Array.ST
 import Control.Monad
 import Control.Monad.ST
---import Debug.Trace
+import Debug.Trace
 
 main :: IO ()
 main = print $ runST $ do
   segT <- buildSegT [2,3,5,7]
+  lazy <- newSegT 4 0
+  modifyRSegT segT lazy (1,3)
   test1 <- forM [1..7] $ \ i -> readArray segT i
-  test2 <- readRSegT segT (2,3)
-  return (test1,test2)
+  test2 <- forM [1..7] $ \ i -> readArray lazy i
+  test3 <- readRSegT segT lazy (2,3)
+  test4 <- forM [1..7] $ \ i -> readArray segT i
+  test5 <- forM [1..7] $ \ i -> readArray lazy i
+  return (test1,test2,test3,test4,test5)
 
 type Elem = Int
 type SegT s = STUArray s Int Elem
+
 --モノイドの単位元
 identity :: Elem
-identity = 1
-
+identity = 10^9
 --モノイドの演算
 (><) :: Elem -> Elem -> Elem
-(><) = (*)
+(><) = min
+
+--区間更新の操作は毎回同じことが仮定されている
+func :: Elem -> Elem
+func = (* 10)
+
+nthfunc :: Int -> Elem -> Elem
+nthfunc 0 a = a
+nthfunc n a = nthfunc (n-1) (func a)
 
 {-
 セグ木について
@@ -34,7 +47,22 @@ sup2によりnを２の冪にする
 セグ木をsegT[1]~[2*n-1] 変数はi
 添え字iに対して、親ノードはi`div`2、子ノードは2*i,2*i+1
 高さは (ceiling $ logBase 2 (fromIntegral i))
-それぞれ関数名のPは一点、Rは範囲の操作
+関数名のP,Rはそれぞれ一点、範囲の操作
+区間更新を行う場合は遅延評価用の別のセグ木を用意する必要がある。
+遅延評価用のセグ木にはfuncによる更新の回数が記録されている。
+・パターン1 func^n(a) >< func^m(b) == func^(n+m)(a >< b)  (n,m >= 0)
+tochild == (`div`2)
+newlanum == (r-l+1+lanum)
+ex)
+func = (*a)
+(><) = (*)
+・パターン2 func(a) >< func(b) == func(a >< b)
+tochild == id
+newlanum == 1+lanum
+その場合例は下の通りになる
+ex)
+func = (+ const)
+(><) = max
 -}
 
 --nを超える最小の２の冪
@@ -82,20 +110,61 @@ modifyPSegT segT i e = do
         writeArray segT (i`div`2) (a >< b)
         sub segT (i`div`2)
 
---セグ木の読み込み
---(left,right)の範囲
-readRSegT :: SegT s -> (Int,Int) -> ST s Elem
-readRSegT segT (left,right) = do
-  bnds <- getBounds segT
-  sub segT (left,right) (fst bnds, (1+(snd bnds))`div`2) 1
+
+--使う場合は遅延評価用のセグ木を他に用意
+modifyRSegT :: SegT s -> SegT s -> (Int,Int) -> ST s ()
+modifyRSegT segT lazy (left,right) = do
+  bnds <- getBounds lazy
+  sub segT lazy (fst bnds, (1+(snd bnds))`div`2) 1
+  return ()
   where
-    sub :: SegT s -> (Int,Int) -> (Int,Int) -> Int -> ST s Elem
-    sub segT (left,right) (l,r) i
-      | r < left || right < l = return identity
+    sub :: SegT s -> SegT s -> (Int,Int) -> Int -> ST s Elem
+    sub segT' lazy' (l,r) i
+      | r < left || right < l = do
+        lanum <- readArray lazy' i
+        a <- readArray segT' i --更新後かチェック必要
+        return $ nthfunc lanum a
       | left <= l && r <= right = do
-        readArray segT i
+        lanum <- readArray lazy' i
+        let newlanum = 1+lanum  --(r-l+1+lanum) パターン２
+        writeArray lazy' i newlanum
+        a <- readArray segT' i
+        return $ nthfunc newlanum a
       | otherwise  = do
         let mid = (l+r)`div`2
-        vr <- sub segT (left,right) (mid+1,r) (2*i+1)
-        vl <- sub segT (left,right) (l,mid) (2*i)
+        a <- sub segT' lazy' (mid+1,r) (2*i+1)
+        b <- sub segT' lazy' (l,mid) (2*i)
+        writeArray segT' i (a >< b)
+        return $ a >< b
+
+--セグ木の読み込み
+--(left,right)の範囲
+readRSegT :: SegT s -> SegT s -> (Int,Int) -> ST s Elem
+readRSegT segT lazy (left,right) = do
+  bnds <- getBounds segT
+  sub segT lazy (fst bnds, (1+(snd bnds))`div`2) 1
+  where
+    sub :: SegT s -> SegT s -> (Int,Int) -> Int -> ST s Elem
+    sub segT' lazy' (l,r) i
+      | r < left || right < l = return identity
+      | left <= l && r <= right = do
+        a <- readArray segT' i
+        lanum <- readArray lazy' i
+        traceShowM (i,lanum)
+        when (lanum /= 0) $ do
+          readArray segT' i >>= \a -> writeArray segT' i (nthfunc lanum a)
+          writeArray lazy' i 0
+        return $ nthfunc lanum a
+      | otherwise  = do
+        let mid = (l+r)`div`2
+            tochild = id --(`div`2)
+        lanum <- readArray lazy' i
+        traceShowM (i,lanum)
+        when (lanum /= 0) $ do
+          readArray segT' i >>= \a -> writeArray segT' i (nthfunc lanum a)
+          writeArray lazy' (2*i)   (tochild lanum)
+          writeArray lazy' (2*i+1) (tochild lanum)
+          writeArray lazy' i 0
+        vr <- sub segT' lazy' (mid+1,r) (2*i+1)
+        vl <- sub segT' lazy' (l,mid) (2*i)
         return $ vr >< vl
